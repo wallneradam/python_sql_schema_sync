@@ -203,6 +203,7 @@ def split_table_schema(sql: str) -> List[str]:
             m = re.match(r"^(?!CONSTRAINT\s)\s*(`?\w+`?).*?(REFERENCES.*)", line, flags=re.I)
             if m:
                 line = re.sub(r'\s*(?:REFERENCES).*$', '', line, flags=re.I)
+                bottom.append("KEY {key} ({field})".format(key=m.groups()[0], field=m.groups()[0]))
                 bottom.append("CONSTRAINT {key} ".format(key=m.groups()[0]) +
                               "FOREIGN KEY ({field}) ".format(field=m.groups()[0]) +
                               "{references}".format(references=m.groups()[1]))
@@ -260,9 +261,11 @@ def process_schema_part(line: str, *, ignore_increment: bool = True) -> Tuple[st
     if ignore_increment:
         line = re.sub(r"\s+AUTO_INCREMENT=[0-9]+", '', line, flags=re.I)
 
-    # Add default sizes if not specified
-    line = re.sub(r"(\sBIGINT)\s(?=\w)", r"\1(20) ", line, flags=re.I)
+    # Add default sizes if not specified to make them comparable
     line = re.sub(r"(\sINT)\s(?=\w)", r"\1(11) ", line, flags=re.I)
+    line = re.sub(r"(\sTINYINT)\s(?=\w)", r"\1(3) ", line, flags=re.I)
+    line = re.sub(r"(\sSMALLINT)\s(?=\w)", r"\1(6) ", line, flags=re.I)
+    line = re.sub(r"(\sBIGINT)\s(?=\w)", r"\1(20) ", line, flags=re.I)
     line = re.sub(r"(\sVARCHAR)\s(?=\w)", r"\1(255) ", line, flags=re.I)
     line = re.sub(r"(\sDATETIME)\s(?=\w)", r"\1(6) ", line, flags=re.I)
 
