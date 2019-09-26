@@ -188,14 +188,24 @@ def split_table_schema(sql: str) -> List[str]:
     bottom = []
 
     def process_line(line):
-        """ Split lines contains PRIMARY KEY or UNIQUE in field definition (not separately) """
+        """ Split lines contains PRIMARY KEY, UNIQUE or REFERENCES in field definition (not separately) """
         nonlocal bottom
-        m = re.match(r"^(`?\w+`?).*?(PRIMARY|UNIQUE)(?: KEY)?", line, flags=re.I)
+        # PRIMARY and UNIQUE
+        m = re.match(r"^(?!PRIMARY\s|UNIQUE\s|KEY\s)\s*(`?\w+`?).*?(PRIMARY|UNIQUE)(?: KEY)?", line, flags=re.I)
         if m:
             line = re.sub(r'\s*(?:PRIMARY KEY|UNIQUE)(?: KEY)?', '', line, flags=re.I)
             bottom.append("{type} KEY ".format(type=m.groups()[1]) +
                           "{key}".format(key=m.groups()[0] + ' ' if m.groups()[1].upper() == 'UNIQUE' else '') +
                           "({field})".format(field=m.groups()[0]))
+
+        else:
+            # REFERENCES
+            m = re.match(r"^(?!CONSTRAINT\s)\s*(`?\w+`?).*?(REFERENCES.*)", line, flags=re.I)
+            if m:
+                line = re.sub(r'\s*(?:REFERENCES).*$', '', line, flags=re.I)
+                bottom.append("CONSTRAINT {key} ".format(key=m.groups()[0]) +
+                              "FOREIGN KEY ({field}) ".format(field=m.groups()[0]) +
+                              "{references}".format(references=m.groups()[1]))
         return line
 
     # Find opening bracket
@@ -571,7 +581,10 @@ CREATE TABLE `user` (
     `modified_at` DATETIME(6) NOT NULL
 ) CHARACTER SET utf8mb4;"""
 
+    print(" - sql1 -> sql2:")
     print(sync(sql1, sql2))
+    print("\n - sql2 -> sql1:")
+    print(sync(sql2, sql1))
     print("\n - Filtered actions:")
     print(sync(sql1, sql2,
                allowed_actions=(ActionTypes.add, ActionTypes.create, ActionTypes.modify)))
@@ -598,7 +611,7 @@ CREATE TABLE `metadata` (
     sql2 = """
 CREATE TABLE `user` (
     `id` BIGINT UNSIGNED NOT NULL PRIMARY KEY AUTO_INCREMENT,
-    `email` VARCHAR(255) NOT NULL UNIQUE,
+    `email` VARCHAR(128) NOT NULL UNIQUE,
     `full_name` VARCHAR(255) NOT NULL,
     `created_at` DATETIME(6) NOT NULL,
     `modified_at` DATETIME(6) NOT NULL,
