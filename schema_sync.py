@@ -6,8 +6,7 @@ Notes:
 
 It is not a full featured SQL parser, just a quick regular expresion based one. Because of this, you
 cannot use 'CREATE TABLE', 'if not exists', etc. strings as field and table comments. It could be
-solved by some text processing tricks, but not worth the effort. Just not use these SQL int
-comments.
+solved by some text processing tricks, but not worth the effort. Just not use these SQL comments.
 
 Also it cannot handle field and table renames. This means if you rename a field, it will create 2
 commands: a DROP and a CREATE. Which cause all your data in the field will be lost. If it is a
@@ -25,6 +24,10 @@ __license__ = "Apache-2.0"
 __version__ = 0.1
 
 __all__ = ['sync']
+
+
+WHITESPACES = (' ', '\t', '\n', '\r')
+OPERATORS = (',', '+', '-', '/', '*', '&', '<', '=', '>', '%', '^')
 
 
 class _DataClass:
@@ -47,6 +50,7 @@ class TableInfo(_DataClass):
 
 
 class ActionTypes(Enum):
+    """ The possible action names """
     create = 'CREATE'  # CREATE TABLE action
     drop = 'DROP'  # DROP TABLE action
     add = 'ADD'  # ADD field action
@@ -55,9 +59,63 @@ class ActionTypes(Enum):
 
 
 def normalize_str(string: str) -> str:
+    """
+    Remove multiple spaces and make lowercase
+    :param string: The string to normalize
+    :return: The normalized string
+    """
     string = string.lower()
     string = re.sub(r'\s+', ' ', string)
     return string
+
+
+def normalize_expr(expression: str) -> str:
+    """
+    Normalze the given SQL expression to be able to compare
+    :param expression: The expression to normalize
+    :return: The normalized expression
+    """
+    res = ''
+
+    in_string = False
+
+    o = 0
+    lc = None
+    try:
+        while True:
+            c = expression[o]
+            if not in_string:
+                if c == "'" or c == '"':   # Found string start
+                    in_string = c
+                else:
+                    # Ensure one space
+                    if c in WHITESPACES:
+                        if lc == ' ':
+                            o += 1
+                            continue
+                        c = ' '
+                    # Remove unnecessary spaces
+                    if c == ' ' and lc in OPERATORS:
+                        o += 1
+                        continue
+                    elif lc == ' ' and c in OPERATORS:
+                        res = res[:-1]
+
+                res += c.lower()
+
+            else:
+                if in_string and c == in_string:
+                    in_string = False
+
+                res += c
+
+            lc = c
+            o += 1
+
+    except IndexError:  # It is expected: shows no more data
+        pass
+
+    return res
 
 
 def get_delimiter_pos(sql: str, *, offset: int, delim: str = ';', skip_in_brackets=False) -> int:
@@ -139,7 +197,7 @@ def filter_comments(sql: str) -> str:
 
             o += 1
 
-    except IndexError:  # It is expected shows no more data
+    except IndexError:  # It is expected: shows no more data
         pass
 
     return res
@@ -178,56 +236,86 @@ def extract_table_sql(name: str, sql: str, *, remove_database_name_from_sql: boo
     return result
 
 
-def split_table_schema(sql: str) -> List[str]:
+def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = True) -> List[str]:
     """
     Splits table schema SQL into a list
+    :param table_name: The name of the table
     :param sql: The table shchema SQL
+    :param ignore_increment: If true, auto increment values are filtered
     :return: Splitted SQL
     """
     res = []
     bottom = []
 
     def process_line(line):
-        """ Split lines contains PRIMARY KEY, UNIQUE or REFERENCES in field definition (not separately) """
+        """ Process line, make some default """
         nonlocal bottom
+
+        # Add default sizes if not specified to make them comparable
+        line = re.sub(r"(\sINT)\s(?=\w)", r"\1(11) ", line, flags=re.I)
+        line = re.sub(r"(\sTINYINT)\s(?=\w)", r"\1(3) ", line, flags=re.I)
+        line = re.sub(r"(\sSMALLINT)\s(?=\w)", r"\1(6) ", line, flags=re.I)
+        line = re.sub(r"(\sBIGINT)\s(?=\w)", r"\1(20) ", line, flags=re.I)
+        line = re.sub(r"(\sVARCHAR)\s(?=\w)", r"\1(255) ", line, flags=re.I)
+        line = re.sub(r"(\sDATETIME)\s(?=\w)", r"\1(6) ", line, flags=re.I)
+        # Bool is tinyint in MySQL
+        line = re.sub(r"\sBOOL\s(?=\w)", r" TINYINT(1) ", line, flags=re.I)
+
+        if ignore_increment:
+            line = re.sub(r"\s+AUTO_INCREMENT=[0-9]+", '', line, flags=re.I)
+
         # PRIMARY and UNIQUE
         m = re.match(r"^(?!PRIMARY\s|UNIQUE\s|KEY\s)\s*(`?\w+`?).*?(PRIMARY|UNIQUE)(?: KEY)?", line, flags=re.I)
         if m:
             line = re.sub(r'\s*(?:PRIMARY KEY|UNIQUE)(?: KEY)?', '', line, flags=re.I)
             bottom.append("{type} KEY ".format(type=m.groups()[1]) +
-                          "{key}".format(key=m.groups()[0] + ' ' if m.groups()[1].upper() == 'UNIQUE' else '') +
+                          "{key}".format(key=(m.groups()[0] + ' ') if m.groups()[1].upper() == 'UNIQUE' else '') +
                           "({field})".format(field=m.groups()[0]))
 
         else:
             # REFERENCES
-            m = re.match(r"^(?!CONSTRAINT\s)\s*(`?\w+`?).*?(REFERENCES.*)", line, flags=re.I)
+            m = re.match(r"^(?!CONSTRAINT\s|FOREIGN\s*KEY\s)\s*`?(\w+)`?.*?(REFERENCES.*)", line, flags=re.I)
             if m:
                 line = re.sub(r'\s*(?:REFERENCES).*$', '', line, flags=re.I)
-                bottom.append("KEY {key} ({field})".format(key=m.groups()[0], field=m.groups()[0]))
-                bottom.append("CONSTRAINT {key} ".format(key=m.groups()[0]) +
-                              "FOREIGN KEY ({field}) ".format(field=m.groups()[0]) +
+                bottom.append("KEY `fk_{table_name}_{key}` (`{field}`)".format(table_name=table_name,
+                                                                               key=m.groups()[0], field=m.groups()[0]))
+                bottom.append("CONSTRAINT `fk_{table_name}_{key}` ".format(table_name=table_name,
+                                                                           key=m.groups()[0]) +
+                              "FOREIGN KEY (`{field}`) ".format(field=m.groups()[0]) +
                               "{references}".format(references=m.groups()[1]))
-        return line
+            else:
+                # FOREIGN KEY without CONSTRAINT
+                m = re.match(r"^FOREIGN\s*KEY\s*\(`?(\w+)`?.*?REFERENCES.*", line, flags=re.I)
+                if m:
+                    return [
+                        "KEY `fk_{table_name}_{key}` (`{field}`)".format(table_name=table_name,
+                                                                         key=m.groups()[0],
+                                                                         field=m.groups()[0]),
+                        "CONSTRAINT `fk_{table_name}_{key}` ".format(table_name=table_name,
+                                                                     key=m.groups()[0]) + line
+                    ]
+
+        return [line]
 
     # Find opening bracket
     open_bracket_pos = get_delimiter_pos(sql, offset=0, delim='(')
     prefix = sql[:open_bracket_pos + 1]
     res.append(prefix)
-    # The body (without prefiy)
+    # The body (without prefix)
     body = sql[open_bracket_pos + 1:]
     # Split by commas
     p = 0
     try:
         while True:
             np = get_delimiter_pos(body, offset=p, delim=',', skip_in_brackets=True)
-            res.append(process_line(body[p:np].strip()))
+            res.extend(process_line(body[p:np].strip()))
             p = np + 1
     # ValueError is expected, when we have no more parts
     except ValueError:
         pass
     # We have a last part till the closing bracket
     close_bracket_pos = get_delimiter_pos(body, offset=p, delim=')', skip_in_brackets=True)
-    res.append(process_line(body[p:close_bracket_pos].strip()))
+    res.extend(process_line(body[p:close_bracket_pos].strip()))
 
     # Add bottom
     res += bottom
@@ -239,11 +327,10 @@ def split_table_schema(sql: str) -> List[str]:
     return res
 
 
-def process_schema_part(line: str, *, ignore_increment: bool = True) -> Tuple[str, str]:
+def extract_and_normalize_keys(line: str) -> Tuple[str, str]:
     """
     Extract and normalize keys from a table schema "line"
     :param line: One line of table schema
-    :param ignore_increment: If true, auto increment values are filtered
     :return: A tuble containing the key and the line
     """
     k = ''
@@ -252,29 +339,25 @@ def process_schema_part(line: str, *, ignore_increment: bool = True) -> Tuple[st
     if m:
         k = m.group()
 
-    # Value definition
     else:
-        m = re.match(r"^`?\w+`?", line)
+        # Foreign keys
+        m = re.match(r"^(CONSTRAINT\s+`?\w+`?)", line, flags=re.I)
         if m:
-            k = '!' + m.group()  # '!' is to make sure fields will be synchronised before the keys
+            k = '!!' + m.group()  # '!!' is to make sure foreign keys will be synchronized before everything else
 
-    if ignore_increment:
-        line = re.sub(r"\s+AUTO_INCREMENT=[0-9]+", '', line, flags=re.I)
-
-    # Add default sizes if not specified to make them comparable
-    line = re.sub(r"(\sINT)\s(?=\w)", r"\1(11) ", line, flags=re.I)
-    line = re.sub(r"(\sTINYINT)\s(?=\w)", r"\1(3) ", line, flags=re.I)
-    line = re.sub(r"(\sSMALLINT)\s(?=\w)", r"\1(6) ", line, flags=re.I)
-    line = re.sub(r"(\sBIGINT)\s(?=\w)", r"\1(20) ", line, flags=re.I)
-    line = re.sub(r"(\sVARCHAR)\s(?=\w)", r"\1(255) ", line, flags=re.I)
-    line = re.sub(r"(\sDATETIME)\s(?=\w)", r"\1(6) ", line, flags=re.I)
+        else:
+            # Value definition
+            m = re.match(r"^`?\w+`?", line)
+            if m:
+                k = '!' + m.group()  # '!' is to make sure fields will be synchronised before the keys
 
     return normalize_str(k), line
 
 
-def compare_table_sql(src_sql: str, dst_sql: str, *, ignore_increment: bool = True) -> List[DiffInfo]:
+def compare_table_sql(table_name: str, src_sql: str, dst_sql: str, *, ignore_increment: bool = True) -> List[DiffInfo]:
     """
     Create a list of differences between source and destination table schema
+    :param table_name: The name of the table to compare
     :param src_sql: The source table schema SQL
     :param dst_sql: The destination table schema SQL
     :param ignore_increment: If true, auto increment values are filtered
@@ -282,13 +365,22 @@ def compare_table_sql(src_sql: str, dst_sql: str, *, ignore_increment: bool = Tr
     """
     res = []
 
-    src_parts = split_table_schema(src_sql)
-    dst_parts = split_table_schema(dst_sql)
+    src_parts = split_table_schema(table_name, src_sql, ignore_increment=ignore_increment)
+    dst_parts = split_table_schema(table_name, dst_sql, ignore_increment=ignore_increment)
 
     src_parts_dict = OrderedDict(
-        [process_schema_part(part, ignore_increment=ignore_increment) for part in src_parts[1:-1]])
+        [extract_and_normalize_keys(part) for part in src_parts[1:-1]])
     dst_parts_dict = OrderedDict(
-        [process_schema_part(part, ignore_increment=ignore_increment) for part in dst_parts[1:-1]])
+        [extract_and_normalize_keys(part) for part in dst_parts[1:-1]])
+
+    # Ensure we have indexes for foreign key constraints in destination table parts
+    indexes_dict = {k: p for k, p in dst_parts_dict.items() if k.startswith('key')}
+    for k, p in dict(dst_parts_dict).items():
+        if k.startswith('!!'):
+            k = k.replace('!!constraint', 'key')
+            if k not in indexes_dict:
+                dst_parts_dict[k] = re.sub(r'^CONSTRAINT\s+(`?\w+`?)\s+FOREIGN KEY\s+(\([^)]+\)).*$', r'KEY \1 \2', p,
+                                           flags=re.I)
 
     src_keys = list(src_parts_dict.keys())
     dst_keys = list(dst_parts_dict.keys())
@@ -302,7 +394,7 @@ def compare_table_sql(src_sql: str, dst_sql: str, *, ignore_increment: bool = Tr
         in_dst = key in dst_keys
         src_orphan = in_src and not in_dst
         dst_orphan = in_dst and not in_src
-        different = in_src and in_dst and normalize_str(src_parts_dict[key]) != normalize_str(dst_parts_dict[key])
+        different = in_src and in_dst and normalize_expr(src_parts_dict[key]) != normalize_expr(dst_parts_dict[key])
         if src_orphan:
             info.src = src_parts_dict[key]
         elif dst_orphan:
@@ -316,6 +408,17 @@ def compare_table_sql(src_sql: str, dst_sql: str, *, ignore_increment: bool = Tr
         res.append(info)
 
     return res
+
+
+def sanitize_sql(table_name: str, sql: str) -> str:
+    """
+    Make not so well formed SQL to more like standard
+    :param table_name: The name of the table
+    :param sql: The table schema SQL
+    :return: The sanitized SQL
+    """
+    parts = split_table_schema(table_name, sql)
+    return parts[0] + "\n    " + ",\n    ".join(parts[1:-1]) + "\n" + parts[-1]
 
 
 def compare_tables(src: str, dst: str, *,
@@ -344,14 +447,14 @@ def compare_tables(src: str, dst: str, *,
 
     res = {}
 
-    for table in all_tables:
+    for table_name in all_tables:
         info = TableInfo()
         # Is it only in source
-        if table in src_orphans:
+        if table_name in src_orphans:
             info.src_orphan = True
         # Is it only in destination
-        elif table in dst_orphans:
-            dst_sql = extract_table_sql(table, dst, remove_database_name_from_sql=remove_database_name_from_sql)
+        elif table_name in dst_orphans:
+            dst_sql = extract_table_sql(table_name, dst, remove_database_name_from_sql=remove_database_name_from_sql)
             # TODO: These may remove text from field and table comments, though very unlikely to put SQL there
             if ignore_increment:
                 dst_sql = re.sub(r"\s*AUTO_INCREMENT=[0-9]+", '', dst_sql, flags=re.I)
@@ -360,17 +463,18 @@ def compare_tables(src: str, dst: str, *,
             if force_if_not_exists:
                 dst_sql = re.sub(r'(CREATE(?:\s*TEMPORARY)?\s*TABLE\s*)(?:IF\sNOT\sEXISTS\s*)?(`?\w+`?)',
                                  r'\1IF NOT EXISTS \2', dst_sql, flags=re.I)
-            info.dst_orphan = dst_sql
+
+            info.dst_orphan = sanitize_sql(table_name, dst_sql)
 
         else:
-            src_sql = extract_table_sql(table, src, remove_database_name_from_sql=remove_database_name_from_sql)
-            dst_sql = extract_table_sql(table, dst, remove_database_name_from_sql=remove_database_name_from_sql)
-            diffs = compare_table_sql(src_sql, dst_sql, ignore_increment=ignore_increment)
+            src_sql = extract_table_sql(table_name, src, remove_database_name_from_sql=remove_database_name_from_sql)
+            dst_sql = extract_table_sql(table_name, dst, remove_database_name_from_sql=remove_database_name_from_sql)
+            diffs = compare_table_sql(table_name, src_sql, dst_sql, ignore_increment=ignore_increment)
 
             if diffs:
                 info.diffs = diffs
 
-        res[table] = info
+        res[table_name] = info
 
     return res
 
@@ -418,7 +522,7 @@ def get_action_sql(table, sql, action) -> Tuple[str, int]:
 
     re_key_field = r"`?\w`?(?:\(\d+\))?"  # matches `name`(10)
     re_key_field_list = r"(?:{}(?:,\s?)?)+".format(re_key_field)  # matches `name`(10),`desc`(255)
-    m = re.match(r"((?:PRIMARY )|(?:UNIQUE )|(?:FULLTEXT ))?KEY `?(\w+)?`?\s(\({}\))".format(re_key_field_list), sql,
+    m = re.match(r"^((?:PRIMARY )|(?:UNIQUE )|(?:FULLTEXT ))?KEY `?(\w+)?`?\s(\({}\))".format(re_key_field_list), sql,
                  flags=re.I)
     if m:
         key_type = (m.groups()[0] or '').strip().upper()
@@ -450,7 +554,14 @@ def get_action_sql(table, sql, action) -> Tuple[str, int]:
                     key_type=key_type, key_name=key_name, fields=fields)
             insert_direction = -1
 
-    else:  # Field operations
+    # Foreign key drops should be before everything
+    elif sql.startswith("CONSTRAINT ") and action == ActionTypes.drop:
+        space_pos = sql.find(' ', 11)  # 11 is len("CONSTRAINT ")
+        res += 'DROP ' + sql[:space_pos]
+        insert_direction = -1
+
+    # Other field operations
+    else:
         res += action.value
 
         if action == ActionTypes.drop:
@@ -466,8 +577,11 @@ def get_action_sql(table, sql, action) -> Tuple[str, int]:
                 table = m[0]
                 foreign_key = m[1]
                 res = re.sub('MODIFY', 'ADD', res, flags=re.I)
-                res = "ALTER TABLE `{table}` FOREIGN key `{foreign_key}`; {res}".format(
+                res = "ALTER TABLE " + "`{table}` DROP FOREIGN key `{foreign_key}`; {res}".format(
                     table=table, foreign_key=foreign_key, res=res)
+
+            elif sql.startswith("CONSTRAINT "):
+                insert_direction = 1
 
     return res, insert_direction
 
