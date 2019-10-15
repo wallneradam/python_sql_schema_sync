@@ -115,10 +115,10 @@ def normalize_expr(expression: str) -> str:
     except IndexError:  # It is expected: shows no more data
         pass
 
-    return res
+    return res.strip()
 
 
-def get_delimiter_pos(sql: str, *, offset: int, delim: str = ';', skip_in_brackets=False) -> int:
+def get_delimiter_pos(sql: str, *, offset: int = 0, delim: str = ';', skip_in_brackets=False) -> int:
     """
     Find next delimiter
     Supports one line (standard) and multiline SQL comments and strings
@@ -130,14 +130,21 @@ def get_delimiter_pos(sql: str, *, offset: int, delim: str = ';', skip_in_bracke
     """
     in_string = False
     in_brackets = 0
+    delim_chars = len(delim)
+    delim_chars_found = 0
 
     try:
         while True:
             c = sql[offset]
             if not in_string:
-                if c == delim and not in_brackets:  # Found the delimter!
-                    return offset
-                elif c == '"' or c == "'":  # Found string start
+                if c == delim[delim_chars_found] and not in_brackets:  # Found the delimter!
+                    delim_chars_found += 1
+                    if delim_chars == delim_chars_found:
+                        return offset - delim_chars_found + 1
+                else:
+                    delim_chars_found = 0
+
+                if c == '"' or c == "'":  # Found string start
                     in_string = c
 
                 elif skip_in_brackets:
@@ -252,14 +259,22 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
         nonlocal bottom
 
         # Add default sizes if not specified to make them comparable
-        line = re.sub(r"(\sINT)\s(?=\w)", r"\1(11) ", line, flags=re.I)
-        line = re.sub(r"(\sTINYINT)\s(?=\w)", r"\1(3) ", line, flags=re.I)
-        line = re.sub(r"(\sSMALLINT)\s(?=\w)", r"\1(6) ", line, flags=re.I)
-        line = re.sub(r"(\sBIGINT)\s(?=\w)", r"\1(20) ", line, flags=re.I)
-        line = re.sub(r"(\sVARCHAR)\s(?=\w)", r"\1(255) ", line, flags=re.I)
-        line = re.sub(r"(\sDATETIME)\s(?=\w)", r"\1(6) ", line, flags=re.I)
+        line = re.sub(r"(\sINT)\s*(?!\()", r"\1(11) ", line, flags=re.I)
+        line = re.sub(r"(\sTINYINT)\s*(?!\()", r"\1(3) ", line, flags=re.I)
+        line = re.sub(r"(\sSMALLINT)\s*(?!\()", r"\1(6) ", line, flags=re.I)
+        line = re.sub(r"(\sBIGINT)\s*(?!\()", r"\1(20) ", line, flags=re.I)
+        line = re.sub(r"(\sVARCHAR)\s*(?!\()", r"\1(255) ", line, flags=re.I)
+        line = re.sub(r"(\sDATETIME)\s*(?!\()", r"\1(6) ", line, flags=re.I)
         # Bool is tinyint in MySQL
-        line = re.sub(r"\sBOOL\s(?=\w)", r" TINYINT(1) ", line, flags=re.I)
+        line = re.sub(r"\sBOOL\s(?!\()", r" TINYINT(1) ", line, flags=re.I)
+
+        # Remove DEFAULT NULL, which is the default, to be easier to compare
+        try:
+            # noinspection PyShadowingNames
+            p = get_delimiter_pos(line, delim=' DEFAULT NULL', skip_in_brackets=True)
+            line = line[:p] + line[p + 13:]  # 13 = len(' DEFAULT NULL')
+        except ValueError:
+            pass
 
         if ignore_increment:
             line = re.sub(r"\s+AUTO_INCREMENT=[0-9]+", '', line, flags=re.I)
