@@ -281,11 +281,19 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
 
         # PRIMARY and UNIQUE
         m = re.match(r"^(?!PRIMARY\s|UNIQUE\s|KEY\s)\s*(`?\w+`?).*?(PRIMARY|UNIQUE)(?: KEY)?", line, flags=re.I)
-        if m:
-            line = re.sub(r'\s*(?:PRIMARY KEY|UNIQUE)(?: KEY)?', '', line, flags=re.I)
-            bottom.append("{type} KEY ".format(type=m.groups()[1]) +
-                          "{key}".format(key=(m.groups()[0] + ' ') if m.groups()[1].upper() == 'UNIQUE' else '') +
-                          "({field})".format(field=m.groups()[0]))
+        m2 = re.match(r"^(UNIQUE)\s*\(((`?\w+`?).*?)\)", line, flags=re.I)  # UNIQUE line without key
+        if m or m2:
+            if m:
+                t = m.groups()[1]
+                k = (m.groups()[0] + ' ') if m.groups()[1].upper() == 'UNIQUE' else ''
+                f = m.groups()[0]
+                line = re.sub(r'\s*(?:PRIMARY KEY|UNIQUE)(?: KEY)?', '', line, flags=re.I)
+                bottom.append("{type} KEY {key} ({fields})".format(type=t, key=k, fields=f))
+            else:
+                t = m2.groups()[0]
+                k = m2.groups()[2]
+                f = m2.groups()[1]
+                line = "{type} KEY {key} ({fields})".format(type=t, key=k, fields=f)
 
         else:
             # REFERENCES
