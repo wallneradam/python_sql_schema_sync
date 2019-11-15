@@ -266,7 +266,7 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
         line = re.sub(r"(\sVARCHAR)\s*(?![(\w])", r"\1(255) ", line, flags=re.I)
         line = re.sub(r"(\sDATETIME)\s*(?![(\w])", r"\1(6) ", line, flags=re.I)
         # Bool is tinyint in MySQL
-        line = re.sub(r"\sBOOL\s(?![(\w])", r" TINYINT(1) ", line, flags=re.I)
+        line = re.sub(r"\sBOOL\s*(?![(\w])", r" TINYINT(1) ", line, flags=re.I)
 
         # Remove DEFAULT NULL, which is the default, to be easier to compare
         try:
