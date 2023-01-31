@@ -21,7 +21,7 @@ __author__ = "Adam Wallner"
 __credits__ = "Kirill Gerasimenko"
 
 __license__ = "Apache-2.0"
-__version__ = 0.1
+__version__ = 0.2
 
 __all__ = ['sync']
 
@@ -267,6 +267,13 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
         line = re.sub(r"(\sDATETIME)\s*(?![(\w])", r"\1(6) ", line, flags=re.I)
         # Bool is tinyint in MySQL
         line = re.sub(r"\sBOOL\s*(?![(\w])", r" TINYINT(1) ", line, flags=re.I)
+        # Default 0 for decimals
+        line = re.sub(r"DEFAULT 0.000000", r"DEFAULT 0", line, flags=re.I)
+
+        # Simplify JSON lines
+        if "CHECK" in line:
+            line = re.sub(r"\s\w+ CHARACTER SET \w+ COLLATE \w+\s+([^\n]+)\s+CHECK \(json_valid\([^)]+\)\)",
+                          r" JSON \1", line, flags=re.I)
 
         # Remove DEFAULT NULL, which is the default, to be easier to compare
         try:
@@ -276,8 +283,16 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
         except ValueError:
             pass
 
+        # Remove ON DELETE RESTRICT, which is the default
+        line = re.sub(r"\sON\s*DELETE\s*RESTRICT", "", line, flags=re.I)
+        # Remove ON UPDATE RESTRICT, which is the default
+        line = re.sub(r"\sON\s*UPDATE\s*RESTRICT", "", line, flags=re.I)
+
         if ignore_increment:
             line = re.sub(r"\s+AUTO_INCREMENT=[0-9]+", '', line, flags=re.I)
+
+        # TODO: implement support USING keyword
+        line = re.sub(r"\s*USING BTREE", '', line, flags=re.I)
 
         # PRIMARY and UNIQUE
         m = re.match(r"^(?!PRIMARY\s|UNIQUE\s|KEY\s)\s*(`?\w+`?).*?(PRIMARY|UNIQUE)(?: KEY)?", line, flags=re.I)
@@ -288,10 +303,10 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
                 k = (m.groups()[0] + ' ') if m.groups()[1].upper() == 'UNIQUE' else ''
                 f = m.groups()[0]
                 line = re.sub(r'\s*(?:PRIMARY KEY|UNIQUE)(?: KEY)?', '', line, flags=re.I)
-                bottom.append("{type} KEY {key} ({fields})".format(type=t, key=k, fields=f))
+                bottom.append("{type} KEY {key}({fields})".format(type=t, key=k, fields=f))
             else:
                 t = m2.groups()[0]
-                k = m2.groups()[2]
+                k = m2.groups()[2].strip()
                 f = m2.groups()[1]
                 line = "{type} KEY {key} ({fields})".format(type=t, key=k, fields=f)
 
@@ -347,6 +362,8 @@ def split_table_schema(table_name: str, sql: str, *, ignore_increment: bool = Tr
     suffix = body[close_bracket_pos:].strip()
     if suffix:
         res.append(suffix)
+
+    _res = "\n".join(res)
     return res
 
 
@@ -545,11 +562,11 @@ def get_action_sql(table, sql, action) -> Tuple[str, int]:
 
     re_key_field = r"`?\w`?(?:\(\d+\))?"  # matches `name`(10)
     re_key_field_list = r"(?:{}(?:,\s?)?)+".format(re_key_field)  # matches `name`(10),`desc`(255)
-    m = re.match(r"^((?:PRIMARY )|(?:UNIQUE )|(?:FULLTEXT ))?KEY `?(\w+)?`?\s(\({}\))".format(re_key_field_list), sql,
-                 flags=re.I)
+    re_fields = r"^((?:PRIMARY )|(?:UNIQUE )|(?:FULLTEXT ))?KEY `?(\w+)?`?\s*(\({}\))".format(re_key_field_list)
+    m = re.match(re_fields, sql, flags=re.I)
     if m:
         key_type = (m.groups()[0] or '').strip().upper()
-        key_name = m.groups()[1].strip()
+        key_name = (m.groups()[1] or '').strip()
         fields = m.groups()[2].strip()
 
         if action == ActionTypes.drop:
@@ -570,18 +587,30 @@ def get_action_sql(table, sql, action) -> Tuple[str, int]:
             if key_type == 'PRIMARY':
                 res += 'DROP PRIMARY KEY, ADD PRIMARY KEY {fields}'.format(fields=fields)
             elif not key_type:
-                res += 'DROP INDEX `{key_name}`, ADD INDEX ` {key_name}` {fields}'.format(
+                res += 'DROP INDEX `{key_name}`, ADD INDEX `{key_name}` {fields}'.format(
                     key_name=key_name, fields=fields)
             else:
-                res += 'DROP INDEX `{key_name}`, ADD {key_type}` {key_name}` {fields}'.format(
+                res += 'DROP INDEX `{key_name}`, ADD {key_type} `{key_name}` {fields}'.format(
                     key_type=key_type, key_name=key_name, fields=fields)
             insert_direction = -1
 
-    # Foreign key drops should be before everything
-    elif sql.startswith("CONSTRAINT ") and action == ActionTypes.drop:
-        space_pos = sql.find(' ', 11)  # 11 is len("CONSTRAINT ")
-        res += 'DROP ' + sql[:space_pos]
-        insert_direction = -1
+    # Foreign key
+    elif sql.startswith("CONSTRAINT "):
+        if action == ActionTypes.add:
+            res += 'ADD ' + sql
+            insert_direction = 1
+        # Modify should be converted to DROP and ADD
+        elif action == ActionTypes.modify:
+            space_pos = sql.find(' ', 11)  # 11 is len("CONSTRAINT ")
+            _res = res
+            res += 'DROP ' + sql[:space_pos] + ';\n'
+            res += _res + 'ADD ' + sql
+            insert_direction = 1
+        # Drops should be before everything
+        elif action == ActionTypes.drop:
+            space_pos = sql.find(' ', 11)  # 11 is len("CONSTRAINT ")
+            res += 'DROP ' + sql[:space_pos]
+            insert_direction = -1
 
     # Other field operations
     else:
@@ -594,16 +623,7 @@ def get_action_sql(table, sql, action) -> Tuple[str, int]:
 
         else:
             res += ' ' + sql
-            # Modify constraint -> drop then create
-            m = re.match(r'TABLE\s+`?([^` ]+)`?\s+MODIFY\s+CONSTRAINT `?([^` ]+)', res, flags=re.I)
-            if m and m.groups()[0] and m.groups()[1]:
-                table = m[0]
-                foreign_key = m[1]
-                res = re.sub('MODIFY', 'ADD', res, flags=re.I)
-                res = "ALTER TABLE " + "`{table}` DROP FOREIGN key `{foreign_key}`; {res}".format(
-                    table=table, foreign_key=foreign_key, res=res)
-
-            elif sql.startswith("CONSTRAINT "):
+            if sql.startswith("CONSTRAINT "):
                 insert_direction = 1
 
     return res, insert_direction
